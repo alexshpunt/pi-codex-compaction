@@ -21,7 +21,7 @@ On older Pi releases, the extension enables its legacy 90% guard. It stops befor
 
 When the active model uses `openai-codex/openai-codex-responses`, the extension handles Pi's `session_before_compact` event. It sends the finalized Responses history to the Codex endpoint with a trailing `compaction_trigger`, stores the returned opaque `compaction` item in Pi's compaction entry, and lets Pi continue the same run with the rebuilt context.
 
-Each compaction also generates a plain-text Pi summary over HTTP SSE. Transient summary errors are retried twice; if the summary still fails, compaction is cancelled so no checkpoint is saved without a portable summary. Codex requests on the same model use the opaque checkpoint and never send the summary to OpenAI. Other models use the summary to continue the session.
+Each compaction also generates a plain-text Pi summary over HTTP SSE. Transient HTTPS errors can be retried up to five total attempts for each request (native checkpoint and text summary). If the summary still fails, compaction is cancelled so no checkpoint is saved without a portable summary. Codex requests on the same model use the opaque checkpoint and never send the summary to OpenAI. Other models use the summary to continue the session.
 
 In interactive mode, each native compaction adds `OpenAI compaction running…` and completion or failure markers to the chat transcript. These durable TUI entries are never included in model context.
 
@@ -60,6 +60,18 @@ On Pi 0.84.4 and later, configure compaction through Pi in `~/.pi/agent/settings
 Pi compacts when context exceeds `contextWindow - reserveTokens`. For example, a `reserveTokens` value of `27200` gives a 90% threshold for a 272k context window.
 
 On older Pi releases only, the fallback defaults to `autoCompact: true` and `thresholdRatio: 0.9`. Existing `~/.pi/agent/pi-codex-compaction.json` and project-local `.pi/pi-codex-compaction.json` overrides remain supported until Pi is upgraded.
+
+Both HTTPS requests default to five total attempts (the first request plus up to four retries). To change this, set `maxAttempts` in `~/.pi/agent/pi-codex-compaction.json` or, for a trusted project, in `.pi/pi-codex-compaction.json`:
+
+```json
+{
+  "maxAttempts": 5
+}
+```
+
+Use a whole number from 1 to 20; invalid values are ignored. The project setting overrides the global setting. Permanent errors and cancelled requests are not retried. The `autoCompact` and `thresholdRatio` fields in these files only control the legacy Pi fallback.
+
+A second summary HTTPS attempt after HTTP 200 can be Pi asking for a better summary, not necessarily a network retry.
 
 ## Data handling
 

@@ -3,6 +3,7 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { needsLegacyCompactionFallback, registerCodexCompactionExtension } from "./index.ts";
 import {
 	buildReplacementHistory,
+	callRemoteCompaction,
 	effectiveInputForBranch,
 	findNativeCheckpoint,
 	mergeFeatureHeader,
@@ -295,6 +296,33 @@ describe("pi-codex-compaction", () => {
 		expect(harness.notifications[0]).toContain("Portable compaction summary is empty");
 	});
 
+	test("uses the configured number of native HTTPS attempts", async () => {
+		let attempts = 0;
+		const result = await callRemoteCompaction({
+			url: "https://example.test/codex/responses", headers: new Headers(), body: {}, model,
+			maxAttempts: 5,
+			fetchImpl: (async () => {
+				attempts++;
+				return attempts < 5
+					? new Response("unavailable", { status: 503, headers: { "retry-after-ms": "0" } })
+					: compactionSse();
+			}) as typeof fetch,
+		});
+		expect(attempts).toBe(5);
+		expect(result.compactionItem.type).toBe("compaction");
+	});
+	test("one native attempt disables retries", async () => {
+		let attempts = 0;
+		await expect(callRemoteCompaction({
+			url: "https://example.test/codex/responses", headers: new Headers(), body: {}, model,
+			maxAttempts: 1,
+			fetchImpl: (async () => {
+				attempts++;
+				return new Response("unavailable", { status: 503 });
+			}) as typeof fetch,
+		})).rejects.toThrow("503");
+		expect(attempts).toBe(1);
+	});
 	test("retries a message-less compaction stream error", async () => {
 		let attempts = 0;
 		globalThis.fetch = (async () => {

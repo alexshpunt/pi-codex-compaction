@@ -2,7 +2,7 @@ import { VERSION, type ExtensionAPI, type ExtensionContext, type SessionEntry } 
 import { summarizeCodex, type SummaryEvent } from "./portable-summary.ts";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
-import { loadLegacyConfig } from "./config.ts";
+import { loadCompactionConfig } from "./config.ts";
 import {
 	buildCodexHeaders,
 	buildCompactionRequestBody,
@@ -177,6 +177,7 @@ export function registerCodexCompactionExtension(
 		signal?: AbortSignal;
 		auth: { apiKey: string; headers?: Record<string, string | null> };
 		onEvent?: (event: RemoteCompactionEvent) => void;
+		maxAttempts: number;
 	}): Promise<{ details: NativeCompactionDetails; usage?: Awaited<ReturnType<typeof callRemoteCompaction>>["usage"] }> => {
 		const sessionId = params.ctx.sessionManager.getSessionId();
 		const allTools = pi.getAllTools();
@@ -197,6 +198,7 @@ export function registerCodexCompactionExtension(
 			model: params.model,
 			signal: params.signal,
 			onEvent: params.onEvent,
+			maxAttempts: params.maxAttempts,
 		});
 		return {
 			details: {
@@ -282,6 +284,7 @@ export function registerCodexCompactionExtension(
 		if (!isOpenAICodexModel(model)) return undefined;
 
 		try {
+			const { maxAttempts } = loadCompactionConfig(ctx.cwd, ctx.isProjectTrusted());
 			const sessionId = ctx.sessionManager.getSessionId();
 			const branch = event.branchEntries as SessionEntry[];
 			const input = effectiveInputForBranch({
@@ -306,13 +309,14 @@ export function registerCodexCompactionExtension(
 						signal: event.signal,
 						auth: { apiKey, headers: auth.headers },
 						onEvent: (diagnostic) => appendDiagnostic({ phase: "native", ...diagnostic }),
+						maxAttempts,
 					})),
 					trackPhase("summary", async () => {
 						const summary = await summarize(event.preparation, model, apiKey,
 							Object.fromEntries(Object.entries(auth.headers ?? {}).filter(
 								(pair): pair is [string, string] => typeof pair[1] === "string",
 							)), event.customInstructions, event.signal, pi.getThinkingLevel(), undefined,
-							(diagnostic: SummaryEvent) => appendDiagnostic({ phase: "summary", ...diagnostic }));
+							(diagnostic: SummaryEvent) => appendDiagnostic({ phase: "summary", ...diagnostic }), maxAttempts);
 						if (!summary.summary.trim()) throw new Error("Portable compaction summary is empty.");
 						return summary;
 					}),
@@ -351,7 +355,7 @@ export function registerCodexCompactionExtension(
 
 	pi.on("turn_end", (_event, ctx) => {
 		if (legacyCompaction || !isOpenAICodexModel(ctx.model)) return;
-		const config = loadLegacyConfig(ctx.cwd, ctx.isProjectTrusted());
+		const config = loadCompactionConfig(ctx.cwd, ctx.isProjectTrusted());
 		if (!config.autoCompact) return;
 
 		const usage = ctx.getContextUsage();

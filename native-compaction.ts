@@ -14,7 +14,6 @@ export const REMOTE_COMPACTION_FEATURE = "remote_compaction_v2";
 export const RETAINED_USER_TOKEN_BUDGET = 64_000;
 
 const DEFAULT_CODEX_BASE_URL = "https://chatgpt.com/backend-api";
-const MAX_REMOTE_RETRIES = 2;
 
 export type JsonObject = Record<string, unknown>;
 export type ResponseItem = JsonObject & { type?: string };
@@ -659,11 +658,12 @@ export async function callRemoteCompaction(params: {
 	model: Model<any>;
 	signal?: AbortSignal;
 	fetchImpl?: typeof fetch;
+	maxAttempts?: number;
 	onEvent?: (event: RemoteCompactionEvent) => void;
 }): Promise<RemoteCompactionResult> {
 	const fetchImpl = params.fetchImpl ?? fetch;
 	let lastError: unknown;
-	for (let attempt = 0; attempt <= MAX_REMOTE_RETRIES; attempt++) {
+	for (let attempt = 0; attempt < (params.maxAttempts ?? 5); attempt++) {
 		params.onEvent?.({ state: "attempt", attempt: attempt + 1 });
 		try {
 			const response = await fetchImpl(params.url, {
@@ -679,7 +679,7 @@ export async function callRemoteCompaction(params: {
 				const message = `OpenAI Codex compaction failed (${response.status}): ${body || response.statusText}`;
 				if (!isRetryableStatus(response.status)) throw new NonRetryableCompactionError(message);
 				const error = new Error(message);
-				if (attempt === MAX_REMOTE_RETRIES) throw error;
+				if (attempt + 1 === (params.maxAttempts ?? 5)) throw error;
 				params.onEvent?.({ state: "retry", attempt: attempt + 2 });
 				lastError = error;
 				await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
@@ -690,7 +690,7 @@ export async function callRemoteCompaction(params: {
 		} catch (error) {
 			if (params.signal?.aborted || error instanceof NonRetryableCompactionError) throw error;
 			lastError = error;
-			if (attempt === MAX_REMOTE_RETRIES) throw error;
+			if (attempt + 1 === (params.maxAttempts ?? 5)) throw error;
 			params.onEvent?.({ state: "retry", attempt: attempt + 2 });
 			await delay(1000 * 2 ** attempt, params.signal);
 		}

@@ -47,6 +47,20 @@ describe("portable Codex summary", () => {
 		expect(events).toContainEqual({ state: "response", attempt: 2, httpStatus: 200, requestId: "req-summary" });
 	});
 
+	test("allows five summary attempts when configured", async () => {
+		let calls = 0;
+		const stream = () => {
+			calls++;
+			const result = createAssistantMessageEventStream();
+			const message = calls < 5 ? response("error", "WebSocket error") : response("stop", "Keep ORCHID-47");
+			result.push({ type: "done", reason: message.stopReason, message });
+			return result;
+		};
+		const result = await summarizeCodex(preparation, model, "test-key", undefined, undefined, undefined, undefined,
+			stream, undefined, 5);
+		expect(result.summary).toContain("ORCHID-47");
+		expect(calls).toBe(5);
+	}, 12_000);
 	test("does not retry permanent summary errors", async () => {
 		let calls = 0;
 		const stream = () => {
