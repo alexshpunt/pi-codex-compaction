@@ -48,7 +48,7 @@ function userEntry(id: string, text: string): SessionEntry {
 	} as SessionEntry;
 }
 
-function extensionHarness(initialBranch: SessionEntry[], hostVersion = "0.84.4") {
+function extensionHarness(initialBranch: SessionEntry[], hostVersion = "0.84.4", summary = "The user asked to remember BLUE-42.") {
 	const handlers = new Map<string, (...args: any[]) => any>();
 	const entryRenderers = new Map<string, (...args: any[]) => any>();
 	let branch = initialBranch;
@@ -66,6 +66,7 @@ function extensionHarness(initialBranch: SessionEntry[], hostVersion = "0.84.4")
 		},
 		getAllTools: () => [],
 		getActiveTools: () => [],
+		getThinkingLevel: () => "medium",
 		registerEntryRenderer(customType: string, renderer: (...args: any[]) => any) {
 			entryRenderers.set(customType, renderer);
 		},
@@ -83,7 +84,11 @@ function extensionHarness(initialBranch: SessionEntry[], hostVersion = "0.84.4")
 			sentUserMessages.push({ content, options });
 		},
 	} as any;
-	registerCodexCompactionExtension(pi, hostVersion);
+	registerCodexCompactionExtension(pi, hostVersion, async (preparation) => ({
+		summary,
+		firstKeptEntryId: preparation.firstKeptEntryId,
+		tokensBefore: preparation.tokensBefore,
+	}));
 
 	const context = {
 		model,
@@ -151,7 +156,7 @@ function compactionSse(encryptedContent = "opaque-state"): Response {
 }
 
 describe("pi-codex-compaction", () => {
-	test("runs native compaction and never replays the local marker", async () => {
+	test("saves a portable summary but sends only the native checkpoint to its Codex model", async () => {
 		let requestBody: JsonObject | undefined;
 		let requestHeaders: Headers | undefined;
 		globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -172,7 +177,7 @@ describe("pi-codex-compaction", () => {
 		}, harness.context);
 
 		expect(result.cancel).toBeUndefined();
-		expect(result.compaction.summary).toContain("OpenAI Codex native compaction checkpoint");
+		expect(result.compaction.summary).toContain("BLUE-42");
 		expect(result.compaction.details.kind).toBe(NATIVE_COMPACTION_KIND);
 		expect(result.compaction.details.replacementHistory.at(-1)).toEqual({
 			type: "compaction",
@@ -248,6 +253,19 @@ describe("pi-codex-compaction", () => {
 		]);
 	});
 
+	test("keeps the old history if the text summary is empty", async () => {
+		globalThis.fetch = (async () => compactionSse()) as typeof fetch;
+		const entry = userEntry("user-1", "Remember BLUE-42.");
+		const harness = extensionHarness([entry], "0.84.4", "");
+		const result = await harness.handlers.get("session_before_compact")!({
+			branchEntries: [entry],
+			preparation: { firstKeptEntryId: "user-1", tokensBefore: 50_000 },
+			reason: "manual", willRetry: false, signal: new AbortController().signal,
+		}, harness.context);
+		expect(result).toEqual({ cancel: true });
+		expect(harness.notifications[0]).toContain("Portable compaction summary is empty");
+	});
+
 	test("retries a message-less compaction stream error", async () => {
 		let attempts = 0;
 		globalThis.fetch = (async () => {
@@ -321,7 +339,7 @@ describe("pi-codex-compaction", () => {
 		}, harness.context);
 
 		expect((harness.getBranch().at(-1) as any).data.state).toBe("running");
-		await Promise.resolve();
+		for (let i = 0; i < 5 && !resolveFetch; i++) await Promise.resolve();
 		expect(resolveFetch).toBeDefined();
 		resolveFetch!(compactionSse());
 		await pending;
@@ -498,6 +516,29 @@ describe("pi-codex-compaction", () => {
 		}, otherContext)).toBeUndefined();
 	});
 
+	test("replays a portable summary when switching Codex models and providers", async () => {
+		const firstUser = userEntry("user-1", "Remember BLUE-42.");
+		const checkpoint = {
+			type: "compaction", id: "compact-1", parentId: "user-1", timestamp: new Date().toISOString(),
+			summary: "The user asked to remember BLUE-42.", firstKeptEntryId: "user-1", tokensBefore: 100,
+			details: { kind: NATIVE_COMPACTION_KIND, version: NATIVE_COMPACTION_VERSION,
+				modelKey: "openai-codex:openai-codex-responses:gpt-test",
+				replacementHistory: [{ type: "compaction", encrypted_content: "opaque-state" }] },
+		} as SessionEntry;
+		const harness = extensionHarness([firstUser, checkpoint]);
+		const switched = { ...harness.context, model: { ...model, id: "gpt-other" } };
+		const patched = await harness.handlers.get("before_provider_request")!({
+			payload: { model: "gpt-other", input: [] },
+		}, switched);
+		expect(harness.aborted).toBe(false);
+		expect(JSON.stringify(patched.input)).toContain("The user asked to remember BLUE-42.");
+		expect(JSON.stringify(patched.input)).not.toContain("opaque-state");
+		const otherProvider = { ...switched, model: { ...model, provider: "anthropic", api: "anthropic-messages" } };
+		expect(harness.handlers.get("context")!({ messages: [
+			{ role: "compactionSummary", summary: "The user asked to remember BLUE-42." },
+		] }, otherProvider)).toBeUndefined();
+	});
+
 	test("aborts rather than sending a malformed local checkpoint", async () => {
 		const firstUser = userEntry("user-1", "hello");
 		const malformed = {
@@ -527,6 +568,19 @@ describe("pi-codex-compaction", () => {
 });
 
 describe("native compaction helpers", () => {
+	test("old checkpoints without a text summary cannot switch models", () => {
+		const checkpoint = {
+			type: "compaction", id: "old", parentId: null, timestamp: new Date().toISOString(),
+			summary: "OpenAI Codex native compaction checkpoint (old).",
+			firstKeptEntryId: "user-1", tokensBefore: 100,
+			details: { kind: NATIVE_COMPACTION_KIND, version: NATIVE_COMPACTION_VERSION,
+				modelKey: "openai-codex:openai-codex-responses:gpt-test",
+				replacementHistory: [{ type: "compaction", encrypted_content: "opaque" }] },
+		} as SessionEntry;
+		expect(() => effectiveInputForBranch({ branch: [checkpoint], model: { ...model, id: "other" }, tools: [] }))
+			.toThrow("no portable summary");
+	});
+
 	test("drops foreign reasoning state and response item ids", () => {
 		const user = userEntry("user-1", "review this change");
 		const assistant = {

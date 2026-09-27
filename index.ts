@@ -1,5 +1,4 @@
-import { randomUUID } from "node:crypto";
-import { VERSION, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { compact, VERSION, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { loadLegacyConfig } from "./config.ts";
@@ -60,10 +59,6 @@ export function needsLegacyCompactionFallback(hostVersion: string): boolean {
 	return false;
 }
 
-function localMarker(): string {
-	return `OpenAI Codex native compaction checkpoint (${randomUUID()}).`;
-}
-
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -81,7 +76,12 @@ function setFeatureHeader(headers: Record<string, string | null>): void {
 	}
 }
 
-export function registerCodexCompactionExtension(pi: ExtensionAPI, hostVersion = VERSION): void {
+/** Register native Codex compaction with a portable Pi summary for model switches. */
+export function registerCodexCompactionExtension(
+	pi: ExtensionAPI,
+	hostVersion = VERSION,
+	summarize: typeof compact = compact,
+): void {
 	const payloadShapeBySession = new Map<string, CachedPayloadShape>();
 	const useLegacyFallback = needsLegacyCompactionFallback(hostVersion);
 	let legacyCompaction: LegacyCompactionState | undefined;
@@ -123,11 +123,8 @@ export function registerCodexCompactionExtension(pi: ExtensionAPI, hostVersion =
 		input: ResponseItem[];
 		basePayload?: JsonObject;
 		signal?: AbortSignal;
+		auth: { apiKey: string; headers?: Record<string, string | null> };
 	}): Promise<{ details: NativeCompactionDetails; usage?: Awaited<ReturnType<typeof callRemoteCompaction>>["usage"] }> => {
-		const auth = await params.ctx.modelRegistry.getApiKeyAndHeaders(params.model);
-		if (!auth.ok || !auth.apiKey) {
-			throw new Error(auth.ok ? "OpenAI Codex authentication is unavailable." : auth.error);
-		}
 		const sessionId = params.ctx.sessionManager.getSessionId();
 		const allTools = pi.getAllTools();
 		const body = buildCompactionRequestBody({
@@ -140,7 +137,9 @@ export function registerCodexCompactionExtension(pi: ExtensionAPI, hostVersion =
 		});
 		const remote = await callRemoteCompaction({
 			url: resolveCodexResponsesUrl(effectiveBaseUrl(params.model)),
-			headers: buildCodexHeaders({ apiKey: auth.apiKey, headers: auth.headers, sessionId }),
+			headers: buildCodexHeaders({ apiKey: params.auth.apiKey, headers: Object.fromEntries(
+				Object.entries(params.auth.headers ?? {}).filter((pair): pair is [string, string] => typeof pair[1] === "string"),
+			), sessionId }),
 			body,
 			model: params.model,
 			signal: params.signal,
@@ -171,7 +170,8 @@ export function registerCodexCompactionExtension(pi: ExtensionAPI, hostVersion =
 
 	pi.on("context", (event, ctx) => {
 		const checkpoint = findNativeCheckpoint(ctx.sessionManager.getBranch() as SessionEntry[]);
-		if (checkpoint.status === "none") return undefined;
+		if (checkpoint.status !== "valid" || !isOpenAICodexModel(ctx.model)
+			|| checkpoint.checkpoint.details.modelKey !== modelKey(ctx.model)) return undefined;
 		return {
 			messages: event.messages.filter((message) => message.role !== "compactionSummary"),
 		};
@@ -237,17 +237,32 @@ export function registerCodexCompactionExtension(pi: ExtensionAPI, hostVersion =
 				excludeLastAssistantError: event.reason === "overflow" && event.willRetry,
 			});
 			const cached = payloadShapeBySession.get(sessionId);
-			const native = await withCompactionStatus(ctx, () => createNativeCheckpoint({
-				ctx,
-				model,
-				input,
-				basePayload: cached?.modelKey === modelKey(model) ? cached.payload : undefined,
-				signal: event.signal,
-			}));
+			const { native, portable } = await withCompactionStatus(ctx, async () => {
+				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+				if (!auth.ok || !auth.apiKey) {
+					throw new Error(auth.ok ? "OpenAI Codex authentication is unavailable." : auth.error);
+				}
+				const [native, portable] = await Promise.all([
+					createNativeCheckpoint({
+						ctx,
+						model,
+						input,
+						basePayload: cached?.modelKey === modelKey(model) ? cached.payload : undefined,
+						signal: event.signal,
+						auth: { apiKey: auth.apiKey, headers: auth.headers },
+					}),
+					summarize(event.preparation, model, auth.apiKey,
+						Object.fromEntries(Object.entries(auth.headers ?? {}).filter(
+							(pair): pair is [string, string] => typeof pair[1] === "string",
+						)), event.customInstructions, event.signal, pi.getThinkingLevel()),
+				]);
+				if (!portable.summary.trim()) throw new Error("Portable compaction summary is empty.");
+				return { native, portable };
+			});
 
 			return {
 				compaction: {
-					summary: localMarker(),
+					summary: portable.summary,
 					firstKeptEntryId: event.preparation.firstKeptEntryId,
 					tokensBefore: event.preparation.tokensBefore,
 					usage: native.usage,

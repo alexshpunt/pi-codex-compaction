@@ -323,7 +323,13 @@ export function effectiveInputForBranch(params: {
 	}
 	if (checkpoint.status === "valid") {
 		if (checkpoint.checkpoint.details.modelKey !== modelKey(params.model)) {
-			throw new Error("The latest OpenAI Codex native compaction checkpoint belongs to a different model.");
+			const entry = branch[checkpoint.checkpoint.entryIndex];
+			if (entry?.type !== "compaction" || !entry.summary.trim()
+				|| entry.summary.startsWith("OpenAI Codex native compaction checkpoint (")) {
+				throw new Error("The latest OpenAI Codex native checkpoint has no portable summary for this model.");
+			}
+			const context = buildSessionContext(branch);
+			return messagesToResponseItems(params.model, convertToLlm(context.messages), params.tools);
 		}
 		const tail = branch.slice(checkpoint.checkpoint.entryIndex + 1);
 		return [

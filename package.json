@@ -1,5 +1,5 @@
 {
-  "name": "@ogulcancelik/pi-codex-compaction",
+  "name": "@alexshp/pi-codex-compaction",
   "version": "0.1.5",
   "description": "OpenAI Codex native remote compaction for Pi's existing compaction lifecycle.",
   "type": "module",
@@ -14,13 +14,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ogulcancelik/pi-extensions.git",
-    "directory": "packages/pi-codex-compaction"
+    "url": "git+https://github.com/alexshpunt/pi-codex-compaction.git"
   },
   "bugs": {
-    "url": "https://github.com/ogulcancelik/pi-extensions/issues"
+    "url": "https://github.com/alexshpunt/pi-codex-compaction/issues"
   },
-  "homepage": "https://github.com/ogulcancelik/pi-extensions/tree/main/packages/pi-codex-compaction#readme",
+  "homepage": "https://github.com/alexshpunt/pi-codex-compaction#readme",
   "engines": {
     "node": ">=22.19.0"
   },
