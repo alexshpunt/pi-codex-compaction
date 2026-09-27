@@ -21,7 +21,7 @@ On older Pi releases, the extension enables its legacy 90% guard. It stops befor
 
 When the active model uses `openai-codex/openai-codex-responses`, the extension handles Pi's `session_before_compact` event. It sends the finalized Responses history to the Codex endpoint with a trailing `compaction_trigger`, stores the returned opaque `compaction` item in Pi's compaction entry, and lets Pi continue the same run with the rebuilt context.
 
-Each compaction also generates a plain-text Pi summary. Codex requests on the same model use the opaque checkpoint and never send the summary to OpenAI. Other models use the summary to continue the session.
+Each compaction also generates a plain-text Pi summary over HTTP SSE. Transient summary errors are retried twice; if the summary still fails, compaction is cancelled so no checkpoint is saved without a portable summary. Codex requests on the same model use the opaque checkpoint and never send the summary to OpenAI. Other models use the summary to continue the session.
 
 In interactive mode, each native compaction adds `OpenAI compaction running…` and completion or failure markers to the chat transcript. These durable TUI entries are never included in model context.
 

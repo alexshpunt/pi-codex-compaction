@@ -1,4 +1,5 @@
 import { compact, VERSION, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { summarizeCodex } from "./portable-summary.ts";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { loadLegacyConfig } from "./config.ts";
@@ -80,7 +81,7 @@ function setFeatureHeader(headers: Record<string, string | null>): void {
 export function registerCodexCompactionExtension(
 	pi: ExtensionAPI,
 	hostVersion = VERSION,
-	summarize: typeof compact = compact,
+	summarize: typeof compact = summarizeCodex,
 ): void {
 	const payloadShapeBySession = new Map<string, CachedPayloadShape>();
 	const useLegacyFallback = needsLegacyCompactionFallback(hostVersion);

@@ -43,6 +43,7 @@
     "index.ts",
     "config.ts",
     "native-compaction.ts",
+    "portable-summary.ts",
     "README.md",
     "LICENSE"
   ]
