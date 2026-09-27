@@ -42,6 +42,14 @@ export type RemoteCompactionResult = {
 	usage?: Usage;
 };
 
+/** Safe metadata for one native HTTPS compaction request or retry. */
+export type RemoteCompactionEvent = {
+	state: "attempt" | "response" | "retry";
+	attempt: number;
+	httpStatus?: number;
+	requestId?: string;
+};
+
 export function isJsonObject(value: unknown): value is JsonObject {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -651,10 +659,12 @@ export async function callRemoteCompaction(params: {
 	model: Model<any>;
 	signal?: AbortSignal;
 	fetchImpl?: typeof fetch;
+	onEvent?: (event: RemoteCompactionEvent) => void;
 }): Promise<RemoteCompactionResult> {
 	const fetchImpl = params.fetchImpl ?? fetch;
 	let lastError: unknown;
 	for (let attempt = 0; attempt <= MAX_REMOTE_RETRIES; attempt++) {
+		params.onEvent?.({ state: "attempt", attempt: attempt + 1 });
 		try {
 			const response = await fetchImpl(params.url, {
 				method: "POST",
@@ -662,12 +672,15 @@ export async function callRemoteCompaction(params: {
 				body: JSON.stringify(params.body),
 				signal: params.signal,
 			});
+			params.onEvent?.({ state: "response", attempt: attempt + 1, httpStatus: response.status,
+				requestId: response.headers.get("x-request-id") ?? undefined });
 			if (!response.ok) {
 				const body = await response.text().catch(() => "");
 				const message = `OpenAI Codex compaction failed (${response.status}): ${body || response.statusText}`;
 				if (!isRetryableStatus(response.status)) throw new NonRetryableCompactionError(message);
 				const error = new Error(message);
 				if (attempt === MAX_REMOTE_RETRIES) throw error;
+				params.onEvent?.({ state: "retry", attempt: attempt + 2 });
 				lastError = error;
 				await delay(parseRetryDelay(response) ?? 1000 * 2 ** attempt, params.signal);
 				continue;
@@ -678,6 +691,7 @@ export async function callRemoteCompaction(params: {
 			if (params.signal?.aborted || error instanceof NonRetryableCompactionError) throw error;
 			lastError = error;
 			if (attempt === MAX_REMOTE_RETRIES) throw error;
+			params.onEvent?.({ state: "retry", attempt: attempt + 2 });
 			await delay(1000 * 2 ** attempt, params.signal);
 		}
 	}

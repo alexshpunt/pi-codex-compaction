@@ -27,17 +27,24 @@ function response(stopReason: "error" | "stop", text: string) {
 describe("portable Codex summary", () => {
 	test("uses SSE and retries a transient WebSocket error before saving the summary", async () => {
 		let calls = 0;
+		const events: any[] = [];
 		const stream = (_model: any, _context: any, options: any) => {
 			expect(options.transport).toBe("sse");
 			calls++;
 			const result = createAssistantMessageEventStream();
+			if (calls === 2) options.onResponse?.({ status: 200, headers: { "x-request-id": "req-summary" } }, model);
 			const message = calls === 1 ? response("error", "WebSocket error") : response("stop", "Keep ORCHID-47");
 			result.push({ type: "done", reason: message.stopReason, message });
 			return result;
 		};
-		const result = await summarizeCodex(preparation, model, "test-key", undefined, undefined, undefined, undefined, stream);
+		const result = await summarizeCodex(preparation, model, "test-key", undefined, undefined, undefined, undefined, stream,
+			(event) => events.push(event));
 		expect(result.summary).toContain("ORCHID-47");
 		expect(calls).toBe(2);
+		expect(events).toContainEqual({ state: "attempt", attempt: 1 });
+		expect(events).toContainEqual({ state: "retry", attempt: 2, error: "WebSocket error" });
+		expect(events).toContainEqual({ state: "attempt", attempt: 2 });
+		expect(events).toContainEqual({ state: "response", attempt: 2, httpStatus: 200, requestId: "req-summary" });
 	});
 
 	test("does not retry permanent summary errors", async () => {

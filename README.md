@@ -39,6 +39,10 @@ Native checkpoints are persisted in `CompactionEntry.details`. Resume, forks, tr
 
 Compaction is fail-closed. If either the native request or the text summary fails, Pi cancels compaction and keeps the previous history. Malformed native checkpoints still block Codex requests. Old checkpoints made by the upstream extension contain only a marker, not a portable summary: continue those sessions on the original model. New checkpoints let you switch freely.
 
+## Compaction diagnostics
+
+Each Codex compaction writes session entries for native and text-summary HTTPS attempts, HTTP response status, retries, and the result of each part. Pi shows these entries in interactive chat and keeps them when the session is reopened. In RPC mode, `get_entries` returns them as `openai-codex-compaction-diagnostic` entries. A response includes the server's `x-request-id` when available. Diagnostic entries store no request body, credentials, or opaque checkpoint. HTTP error bodies are reduced to the status code; other error messages are shortened and redacted. An HTTP status or request ID can help locate a failed request, but a connection failure may have neither.
+
 ## Configuration
 
 On Pi 0.84.4 and later, configure compaction through Pi in `~/.pi/agent/settings.json` or project-local `.pi/settings.json`:

@@ -187,7 +187,7 @@ describe("pi-codex-compaction", () => {
 		expect((requestBody!.input as JsonObject[]).at(-1)).toEqual({ type: "compaction_trigger" });
 		expect(JSON.stringify(requestBody)).not.toContain("checkpoint");
 		expect(requestHeaders!.get("x-codex-beta-features")).toContain("remote_compaction_v2");
-		expect(harness.getBranch().slice(1).map((entry: any) => entry.data?.state)).toEqual([
+		expect(harness.getBranch().filter((entry: any) => entry.customType === "openai-codex-compaction-status").map((entry: any) => entry.data?.state)).toEqual([
 			"running",
 			"complete",
 		]);
@@ -233,8 +233,35 @@ describe("pi-codex-compaction", () => {
 		expect(filteredContext.messages[0].role).toBe("user");
 	});
 
+	test("keeps a safe request log in an RPC session", async () => {
+		globalThis.fetch = (async () => {
+			const response = compactionSse();
+			response.headers.set("x-request-id", "req-123");
+			return response;
+		}) as typeof fetch;
+		const entry = userEntry("user-1", "Remember ORCHID-47.");
+		const harness = extensionHarness([entry]);
+		const result = await harness.handlers.get("session_before_compact")!({
+			branchEntries: [entry],
+			preparation: { firstKeptEntryId: "user-1", tokensBefore: 50_000 },
+			reason: "manual", willRetry: false, signal: new AbortController().signal,
+		}, { ...harness.context, mode: "rpc" });
+		expect(result.compaction.summary).toContain("BLUE-42");
+		const log = harness.getBranch().filter((item: any) => item.customType === "openai-codex-compaction-diagnostic")
+			.map((item: any) => item.data);
+		expect(log).toContainEqual({ phase: "native", state: "attempt", attempt: 1 });
+		expect(log).toContainEqual({ phase: "native", state: "response", attempt: 1, httpStatus: 200, requestId: "req-123" });
+		expect(log).toContainEqual({ phase: "native", state: "complete" });
+		expect(log).toContainEqual({ phase: "summary", state: "complete" });
+		expect(JSON.stringify(log)).not.toContain("opaque-state");
+		expect(JSON.stringify(log)).not.toContain(token());
+		const render = harness.entryRenderers.get("openai-codex-compaction-diagnostic")!;
+		const line = render({ data: log.find((item: any) => item.phase === "native" && item.state === "response") }, {}, { fg: (_color: string, text: string) => text }).render(80).join("\n");
+		expect(line).toContain("HTTP 200 (request req-123)");
+	});
+
 	test("cancels Pi compaction instead of falling back to text summarization", async () => {
-		globalThis.fetch = (async () => new Response("bad request", { status: 400 })) as typeof fetch;
+		globalThis.fetch = (async () => new Response("Bearer test-secret", { status: 400 })) as typeof fetch;
 		const entry = userEntry("user-1", "hello");
 		const harness = extensionHarness([entry]);
 		const result = await harness.handlers.get("session_before_compact")!({
@@ -246,8 +273,10 @@ describe("pi-codex-compaction", () => {
 		}, harness.context);
 
 		expect(result).toEqual({ cancel: true });
-		expect(harness.notifications[0]).toContain("native compaction failed");
-		expect(harness.getBranch().slice(1).map((entry: any) => entry.data?.state)).toEqual([
+		expect(harness.notifications[0]).toContain("compaction failed (400)");
+		expect(JSON.stringify(harness.getBranch())).not.toContain("test-secret");
+		expect(JSON.stringify(harness.notifications)).not.toContain("test-secret");
+		expect(harness.getBranch().filter((entry: any) => entry.customType === "openai-codex-compaction-status").map((entry: any) => entry.data?.state)).toEqual([
 			"running",
 			"failed",
 		]);
@@ -320,7 +349,7 @@ describe("pi-codex-compaction", () => {
 
 		expect(attempts).toBe(1);
 		expect(result).toEqual({ cancel: true });
-		expect(harness.notifications).toContain("OpenAI Codex native compaction failed: explicit failure");
+		expect(harness.notifications).toContain("OpenAI Codex compaction failed: explicit failure");
 	});
 
 	test("shows the running marker while Pi compaction is in progress", async () => {

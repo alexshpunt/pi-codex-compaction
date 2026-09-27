@@ -1,5 +1,5 @@
-import { compact, VERSION, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { summarizeCodex } from "./portable-summary.ts";
+import { VERSION, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { summarizeCodex, type SummaryEvent } from "./portable-summary.ts";
 import type { Model } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { loadLegacyConfig } from "./config.ts";
@@ -22,6 +22,7 @@ import {
 	type JsonObject,
 	type NativeCompactionDetails,
 	type ResponseItem,
+	type RemoteCompactionEvent,
 } from "./native-compaction.ts";
 
 type CachedPayloadShape = {
@@ -34,6 +35,15 @@ type CompactionStatus = {
 	error?: string;
 };
 
+type CompactionDiagnostic = {
+	phase: "native" | "summary";
+	state: "attempt" | "response" | "retry" | "complete" | "failed";
+	attempt?: number;
+	httpStatus?: number;
+	requestId?: string;
+	error?: string;
+};
+
 type LegacyCompactionState = {
 	sessionId: string;
 	phase: "armed" | "compacting" | "compacted";
@@ -41,6 +51,7 @@ type LegacyCompactionState = {
 };
 
 const COMPACTION_STATUS_KIND = "openai-codex-compaction-status";
+const COMPACTION_DIAGNOSTIC_KIND = "openai-codex-compaction-diagnostic";
 const PI_MID_RUN_COMPACTION_MIN_VERSION = "0.84.4";
 const CONTINUATION_PROMPT = "Compaction completed. Continue.";
 
@@ -64,6 +75,14 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function diagnosticError(error: unknown): string {
+	return errorMessage(error)
+		.replace(/(failed \(\d+\)):.*/i, "$1")
+		.replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+		.replace(/(?:[\w-]+\.){2}[\w-]+/g, "[redacted]")
+		.slice(0, 200);
+}
+
 function effectiveBaseUrl(model: Model<any>): string | undefined {
 	return model.baseUrl;
 }
@@ -81,7 +100,7 @@ function setFeatureHeader(headers: Record<string, string | null>): void {
 export function registerCodexCompactionExtension(
 	pi: ExtensionAPI,
 	hostVersion = VERSION,
-	summarize: typeof compact = summarizeCodex,
+	summarize: typeof summarizeCodex = summarizeCodex,
 ): void {
 	const payloadShapeBySession = new Map<string, CachedPayloadShape>();
 	const useLegacyFallback = needsLegacyCompactionFallback(hostVersion);
@@ -99,6 +118,38 @@ export function registerCodexCompactionExtension(
 		return new Text(theme.fg("error", `✗ OpenAI compaction failed${suffix}`), 0, 0);
 	});
 
+	pi.registerEntryRenderer<CompactionDiagnostic>(COMPACTION_DIAGNOSTIC_KIND, (entry, _options, theme) => {
+		const data = entry.data;
+		if (!data) return new Text(theme.fg("muted", "Codex compaction diagnostic unavailable"), 0, 0);
+		const phase = data.phase === "native" ? "native checkpoint" : "text summary";
+		const attempt = data.attempt ? ` #${data.attempt}` : "";
+		const requestId = data.requestId ? ` (request ${data.requestId})` : "";
+		if (data.state === "attempt") return new Text(theme.fg("muted", `◐ Codex ${phase} HTTPS attempt${attempt}`), 0, 0);
+		if (data.state === "response") return new Text(theme.fg("muted", `↳ Codex ${phase} HTTP ${data.httpStatus}${requestId}`), 0, 0);
+		if (data.state === "retry") return new Text(theme.fg("warning", `↻ Codex ${phase} retry${attempt}${data.error ? `: ${data.error}` : ""}`), 0, 0);
+		if (data.state === "complete") return new Text(theme.fg("success", `✓ Codex ${phase} complete`), 0, 0);
+		return new Text(theme.fg("error", `✗ Codex ${phase} failed${data.error ? `: ${data.error}` : ""}`), 0, 0);
+	});
+
+	const appendDiagnostic = (diagnostic: CompactionDiagnostic): void => {
+		pi.appendEntry(COMPACTION_DIAGNOSTIC_KIND, {
+			...diagnostic,
+			...(diagnostic.error ? { error: diagnosticError(diagnostic.error) } : {}),
+			...(diagnostic.requestId && /^[\w.:-]{1,80}$/.test(diagnostic.requestId)
+				? {} : { requestId: undefined }),
+		});
+	};
+
+	const trackPhase = async <T>(phase: CompactionDiagnostic["phase"], operation: () => Promise<T>): Promise<T> => {
+		try {
+			const result = await operation();
+			appendDiagnostic({ phase, state: "complete" });
+			return result;
+		} catch (error) {
+			appendDiagnostic({ phase, state: "failed", error: diagnosticError(error) });
+			throw error;
+		}
+	};
 	const appendCompactionStatus = (ctx: ExtensionContext, status: CompactionStatus): void => {
 		if (ctx.mode === "tui") pi.appendEntry(COMPACTION_STATUS_KIND, status);
 	};
@@ -113,7 +164,7 @@ export function registerCodexCompactionExtension(
 			appendCompactionStatus(ctx, { state: "complete" });
 			return result;
 		} catch (error) {
-			appendCompactionStatus(ctx, { state: "failed", error: errorMessage(error) });
+			appendCompactionStatus(ctx, { state: "failed", error: diagnosticError(error) });
 			throw error;
 		}
 	};
@@ -125,6 +176,7 @@ export function registerCodexCompactionExtension(
 		basePayload?: JsonObject;
 		signal?: AbortSignal;
 		auth: { apiKey: string; headers?: Record<string, string | null> };
+		onEvent?: (event: RemoteCompactionEvent) => void;
 	}): Promise<{ details: NativeCompactionDetails; usage?: Awaited<ReturnType<typeof callRemoteCompaction>>["usage"] }> => {
 		const sessionId = params.ctx.sessionManager.getSessionId();
 		const allTools = pi.getAllTools();
@@ -144,6 +196,7 @@ export function registerCodexCompactionExtension(
 			body,
 			model: params.model,
 			signal: params.signal,
+			onEvent: params.onEvent,
 		});
 		return {
 			details: {
@@ -243,21 +296,27 @@ export function registerCodexCompactionExtension(
 				if (!auth.ok || !auth.apiKey) {
 					throw new Error(auth.ok ? "OpenAI Codex authentication is unavailable." : auth.error);
 				}
+				const apiKey = auth.apiKey;
 				const [native, portable] = await Promise.all([
-					createNativeCheckpoint({
+					trackPhase("native", () => createNativeCheckpoint({
 						ctx,
 						model,
 						input,
 						basePayload: cached?.modelKey === modelKey(model) ? cached.payload : undefined,
 						signal: event.signal,
-						auth: { apiKey: auth.apiKey, headers: auth.headers },
+						auth: { apiKey, headers: auth.headers },
+						onEvent: (diagnostic) => appendDiagnostic({ phase: "native", ...diagnostic }),
+					})),
+					trackPhase("summary", async () => {
+						const summary = await summarize(event.preparation, model, apiKey,
+							Object.fromEntries(Object.entries(auth.headers ?? {}).filter(
+								(pair): pair is [string, string] => typeof pair[1] === "string",
+							)), event.customInstructions, event.signal, pi.getThinkingLevel(), undefined,
+							(diagnostic: SummaryEvent) => appendDiagnostic({ phase: "summary", ...diagnostic }));
+						if (!summary.summary.trim()) throw new Error("Portable compaction summary is empty.");
+						return summary;
 					}),
-					summarize(event.preparation, model, auth.apiKey,
-						Object.fromEntries(Object.entries(auth.headers ?? {}).filter(
-							(pair): pair is [string, string] => typeof pair[1] === "string",
-						)), event.customInstructions, event.signal, pi.getThinkingLevel()),
 				]);
-				if (!portable.summary.trim()) throw new Error("Portable compaction summary is empty.");
 				return { native, portable };
 			});
 
@@ -275,7 +334,7 @@ export function registerCodexCompactionExtension(
 				legacyCompaction = undefined;
 			}
 			if (!event.signal.aborted && ctx.hasUI) {
-				ctx.ui.notify(`OpenAI Codex native compaction failed: ${errorMessage(error)}`, "error");
+				ctx.ui.notify(`OpenAI Codex compaction failed: ${diagnosticError(error)}`, "error");
 			}
 			return { cancel: true };
 		}
